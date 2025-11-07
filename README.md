@@ -104,7 +104,7 @@ To provide patients with a seamless digital platform for booking medical appoint
 ```mermaid
 graph TD
     A[Patient Mobile/Web App] -->|Login & Auth| B[Azure AD B2C / Entra ID]
-    A -->|Search Doctors| C[Doctor Directory API (Azure Function)]
+    A -->|Search Doctors| C[Doctor Directory API Azure Function]
     C --> D[Azure SQL - Doctor Profiles]
     A -->|Upload Docs| E[Azure Blob Storage]
     A -->|Book Appointment| F[Azure Function - Reservation API]
@@ -140,4 +140,3 @@ graph TD
 
 ---
 
-Would you like me to extend this with a **data model and CRUD stored procedures (Azure SQL)** for the Patient, Doctor, Appointment, Pharmacy, and LabWork tables — or include an **HTML + Bootstrap interface mockup** for the patient reservation flow?
