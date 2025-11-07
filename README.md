@@ -932,4 +932,355 @@ BEGIN
 END;
 GO
 ```
+Excellent — let’s extend the SmartHealth data layer by adding **Prescription**, **PrescriptionItem**, and **Notification** tables, along with fully defined **CRUD stored procedures** and built-in hooks to trigger Service Bus / Event Grid notifications for downstream integration.
+
+---
+
+## ⚕️ 1️⃣ Prescription & PrescriptionItem Tables
+
+### 1.1 Table: `Prescription`
+
+Captures prescription orders issued by doctors and associated with an appointment.
+
+```sql
+CREATE TABLE dbo.Prescription (
+    PrescriptionId       INT IDENTITY(1,1) PRIMARY KEY,
+    AppointmentId        INT NOT NULL,
+    PatientId            INT NOT NULL,
+    DoctorId             INT NOT NULL,
+    PharmacyId           INT NULL,
+    IssueDateUtc         DATETIME2(3) NOT NULL DEFAULT (SYSUTCDATETIME()),
+    Notes                NVARCHAR(MAX) NULL,
+    Status               NVARCHAR(50) NOT NULL DEFAULT ('Pending'),
+    FulfilledDateUtc     DATETIME2(3) NULL,
+    CreatedAtUtc         DATETIME2(3) NOT NULL DEFAULT (SYSUTCDATETIME()),
+    UpdatedAtUtc         DATETIME2(3) NULL,
+    CONSTRAINT FK_Prescription_Appointment FOREIGN KEY (AppointmentId) REFERENCES dbo.Appointment(AppointmentId),
+    CONSTRAINT FK_Prescription_Patient FOREIGN KEY (PatientId) REFERENCES dbo.Patient(PatientId),
+    CONSTRAINT FK_Prescription_Doctor FOREIGN KEY (DoctorId) REFERENCES dbo.Doctor(DoctorId),
+    CONSTRAINT FK_Prescription_Pharmacy FOREIGN KEY (PharmacyId) REFERENCES dbo.Pharmacy(PharmacyId)
+);
+GO
+```
+
+---
+
+### 1.2 Table: `PrescriptionItem`
+
+Stores individual medication entries under a prescription.
+
+```sql
+CREATE TABLE dbo.PrescriptionItem (
+    PrescriptionItemId  INT IDENTITY(1,1) PRIMARY KEY,
+    PrescriptionId      INT NOT NULL,
+    DrugName            NVARCHAR(200) NOT NULL,
+    Dosage              NVARCHAR(100) NOT NULL,
+    Frequency           NVARCHAR(100) NOT NULL,   -- e.g., 1 tablet twice daily
+    DurationDays        INT NOT NULL,
+    Quantity            INT NOT NULL,
+    Instructions        NVARCHAR(500) NULL,
+    CreatedAtUtc        DATETIME2(3) NOT NULL DEFAULT (SYSUTCDATETIME()),
+    CONSTRAINT FK_PrescriptionItem_Prescription FOREIGN KEY (PrescriptionId) REFERENCES dbo.Prescription(PrescriptionId)
+);
+GO
+```
+
+---
+
+## 💊 2️⃣ Prescription CRUD Stored Procedures
+
+### 2.1 Create Prescription
+
+```sql
+CREATE OR ALTER PROCEDURE dbo.Prescription_Create
+(
+    @AppointmentId   INT,
+    @PatientId       INT,
+    @DoctorId        INT,
+    @PharmacyId      INT = NULL,
+    @Notes           NVARCHAR(MAX) = NULL
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    INSERT INTO dbo.Prescription
+    (AppointmentId, PatientId, DoctorId, PharmacyId, Notes)
+    VALUES
+    (@AppointmentId, @PatientId, @DoctorId, @PharmacyId, @Notes);
+
+    DECLARE @PrescriptionId INT = SCOPE_IDENTITY();
+
+    -- Send event notification (Service Bus / Event Grid integration)
+    EXEC dbo.Notification_Create
+        @EntityType = 'Prescription',
+        @EntityId = @PrescriptionId,
+        @EventType = 'Prescription.Created',
+        @Payload = CONCAT('{"PrescriptionId":', @PrescriptionId, ',"PatientId":', @PatientId, '}');
+
+    SELECT @PrescriptionId AS PrescriptionId;
+END;
+GO
+```
+
+---
+
+### 2.2 Get Prescription
+
+```sql
+CREATE OR ALTER PROCEDURE dbo.Prescription_GetById
+(
+    @PrescriptionId INT
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT p.*, pa.FirstName AS PatientFirstName, pa.LastName AS PatientLastName,
+           d.FirstName AS DoctorFirstName, d.LastName AS DoctorLastName,
+           ph.Name AS PharmacyName
+    FROM dbo.Prescription p
+    JOIN dbo.Patient pa ON p.PatientId = pa.PatientId
+    JOIN dbo.Doctor d ON p.DoctorId = d.DoctorId
+    LEFT JOIN dbo.Pharmacy ph ON p.PharmacyId = ph.PharmacyId
+    WHERE p.PrescriptionId = @PrescriptionId;
+END;
+GO
+```
+
+---
+
+### 2.3 Update Prescription Status
+
+```sql
+CREATE OR ALTER PROCEDURE dbo.Prescription_UpdateStatus
+(
+    @PrescriptionId   INT,
+    @Status           NVARCHAR(50),
+    @Notes            NVARCHAR(MAX) = NULL
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    UPDATE dbo.Prescription
+    SET Status = @Status,
+        Notes = ISNULL(@Notes, Notes),
+        UpdatedAtUtc = SYSUTCDATETIME()
+    WHERE PrescriptionId = @PrescriptionId;
+
+    -- Fire notification event
+    EXEC dbo.Notification_Create
+        @EntityType = 'Prescription',
+        @EntityId = @PrescriptionId,
+        @EventType = CONCAT('Prescription.', @Status),
+        @Payload = CONCAT('{"PrescriptionId":', @PrescriptionId, '}');
+END;
+GO
+```
+
+---
+
+### 2.4 Delete Prescription (soft delete)
+
+```sql
+CREATE OR ALTER PROCEDURE dbo.Prescription_Delete
+(
+    @PrescriptionId INT
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    UPDATE dbo.Prescription
+    SET Status = 'Cancelled',
+        UpdatedAtUtc = SYSUTCDATETIME()
+    WHERE PrescriptionId = @PrescriptionId;
+
+    EXEC dbo.Notification_Create
+        @EntityType = 'Prescription',
+        @EntityId = @PrescriptionId,
+        @EventType = 'Prescription.Cancelled',
+        @Payload = CONCAT('{"PrescriptionId":', @PrescriptionId, '}');
+END;
+GO
+```
+
+---
+
+### 2.5 Create Prescription Items
+
+```sql
+CREATE OR ALTER PROCEDURE dbo.PrescriptionItem_Create
+(
+    @PrescriptionId   INT,
+    @DrugName         NVARCHAR(200),
+    @Dosage           NVARCHAR(100),
+    @Frequency        NVARCHAR(100),
+    @DurationDays     INT,
+    @Quantity         INT,
+    @Instructions     NVARCHAR(500) = NULL
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    INSERT INTO dbo.PrescriptionItem
+    (PrescriptionId, DrugName, Dosage, Frequency, DurationDays, Quantity, Instructions)
+    VALUES
+    (@PrescriptionId, @DrugName, @Dosage, @Frequency, @DurationDays, @Quantity, @Instructions);
+
+    DECLARE @ItemId INT = SCOPE_IDENTITY();
+
+    EXEC dbo.Notification_Create
+        @EntityType = 'PrescriptionItem',
+        @EntityId = @ItemId,
+        @EventType = 'PrescriptionItem.Created',
+        @Payload = CONCAT('{"PrescriptionItemId":', @ItemId, ',"PrescriptionId":', @PrescriptionId, '}');
+
+    SELECT @ItemId AS PrescriptionItemId;
+END;
+GO
+```
+
+---
+
+### 2.6 Read Prescription Items
+
+```sql
+CREATE OR ALTER PROCEDURE dbo.PrescriptionItem_GetByPrescription
+(
+    @PrescriptionId INT
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    SELECT *
+    FROM dbo.PrescriptionItem
+    WHERE PrescriptionId = @PrescriptionId;
+END;
+GO
+```
+
+---
+
+## 🔔 3️⃣ Notification Table + Service Bus / Event Grid Integration
+
+### 3.1 Table: `Notification`
+
+This table records all system-generated events (prescription created, lab approved, appointment booked, etc.)
+An Azure Function can subscribe to these new entries via SQL trigger or poll, and forward them to **Azure Service Bus** or **Event Grid** for downstream integration.
+
+```sql
+CREATE TABLE dbo.Notification (
+    NotificationId     INT IDENTITY(1,1) PRIMARY KEY,
+    EntityType         NVARCHAR(100) NOT NULL,    -- e.g., Prescription, Appointment
+    EntityId           INT NOT NULL,
+    EventType          NVARCHAR(100) NOT NULL,    -- e.g., Prescription.Created
+    Payload            NVARCHAR(MAX) NULL,        -- JSON message payload
+    IsPublished        BIT NOT NULL DEFAULT (0),
+    PublishedAtUtc     DATETIME2(3) NULL,
+    CreatedAtUtc       DATETIME2(3) NOT NULL DEFAULT (SYSUTCDATETIME())
+);
+GO
+
+CREATE INDEX IX_Notification_PublishStatus ON dbo.Notification (IsPublished, CreatedAtUtc);
+```
+
+---
+
+### 3.2 Stored Procedure: `Notification_Create`
+
+```sql
+CREATE OR ALTER PROCEDURE dbo.Notification_Create
+(
+    @EntityType NVARCHAR(100),
+    @EntityId   INT,
+    @EventType  NVARCHAR(100),
+    @Payload    NVARCHAR(MAX)
+)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    INSERT INTO dbo.Notification (EntityType, EntityId, EventType, Payload)
+    VALUES (@EntityType, @EntityId, @EventType, @Payload);
+END;
+GO
+```
+
+---
+
+### 3.3 (Optional) Publish Queue Integration
+
+In Azure, you can pair this with a **Change Tracking** or **SQL Trigger → Service Bus Function App**:
+
+```sql
+CREATE OR ALTER TRIGGER trg_Notification_OnInsert
+ON dbo.Notification
+AFTER INSERT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @Payload NVARCHAR(MAX);
+
+    SELECT @Payload = Payload FROM inserted;
+
+    -- Insert to a staging queue or Service Bus binding (via Function App)
+    -- Example: FunctionApp listens on "NotificationQueue"
+    EXEC sp_send_dbmail
+        @profile_name = 'AzureFunctionBridge',
+        @recipients   = 'smarthealth@servicebus.local',
+        @subject      = 'Notification Published',
+        @body         = @Payload;
+END;
+GO
+```
+
+> 💡 In production, this trigger would be replaced by an **Azure Function bound to the SQL table** via **Change Tracking / Debezium / Event Grid** to push new notifications to **Service Bus topics** or **Event Grid events**.
+
+---
+
+## 4️⃣ Event Grid Schema Example (for downstream consumers)
+
+Example JSON payload sent to Event Grid when a prescription is created:
+
+```json
+{
+  "id": "6f1d9c80-3b5e-4f2a-a6a3-84e36f41e011",
+  "eventType": "Prescription.Created",
+  "subject": "Prescription/1234",
+  "data": {
+    "PrescriptionId": 1234,
+    "PatientId": 77,
+    "DoctorId": 45,
+    "Status": "Pending"
+  },
+  "eventTime": "2025-11-07T18:32:55Z",
+  "dataVersion": "1.0"
+}
+```
+
+---
+
+## 5️⃣ End-to-End Event Flow (Diagram)
+
+```mermaid
+sequenceDiagram
+    participant P as Patient App
+    participant API as Azure Function API
+    participant SQL as Azure SQL DB
+    participant EV as Event Grid / Service Bus
+    participant RX as Pharmacy System
+
+    P->>API: Confirm appointment / prescription
+    API->>SQL: Execute dbo.Prescription_Create
+    SQL-->>API: Returns PrescriptionId
+    SQL-->>SQL: dbo.Notification_Create inserts event
+    API-->>EV: Push event to Event Grid Topic
+    EV-->>RX: Notify pharmacy for fulfillment
+    RX-->>P: Confirmation SMS/Push Notification
+```
 
